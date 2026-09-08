@@ -1,0 +1,12 @@
+# 运行产物（每次运行自动重新生成，不入库）
+output/
+
+# 逆向接口/验证数据时用的探索脚本与原始数据
+tools/
+
+# 早期 Node.js/Puppeteer 方案的残留文件
+_obsolete-nodejs/
+
+# 临时文件
+*.log
+*.tmp
