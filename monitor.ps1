@@ -416,7 +416,26 @@ try {
     }
 
     if ($SelfTest) {
-        Write-Log '自检模式：接口连通正常，目录读取成功。' 'OK'
+        # 自检不能只看目录：真的走一遍 threeLevelName + operateData，确认数据链路可用。
+        # （batchSize 配错、接口路径变更、被网关拦成非 JSON 这类问题，原来在自检里看不出来。）
+        $probe = $targets[0]
+        $probeTa = [int](@($cfg.scan.tariffAttributes)[0])
+        $probeScope = '全国资费'
+        if ($probeTa -eq 2) { $probeScope = '本省资费' }
+        $opts = @(Get-ThirdLevelOptions -TariffAttributes $probeTa -FirstLevel $probe.FirstLevel -SecondLevel $probe.SecondLevel)
+        Write-Log ('自检：目录读取成功；抽查 ' + $probe.FirstLevelName + '>' + $probe.SecondLevelName + '（' + $probeScope + '）选项 ' + $opts.Count + ' 个') 'OK'
+        if ($opts.Count -eq 0) {
+            Write-Log '自检：抽查分类没有可选项，无法验证明细接口（可能是该分类暂时为空）' 'WARN'
+        } else {
+            $probeIds = @($opts | Select-Object -First ([Math]::Min(3, $opts.Count)) | ForEach-Object { [string]$_.id })
+            $probePlans = @(Get-PlanDetails -Ids $probeIds)
+            Write-Log ('自检：明细接口返回 ' + $probePlans.Count + ' 条 / 请求 ' + $probeIds.Count + ' 个 ID') 'OK'
+            if ($probePlans.Count -ne $probeIds.Count) {
+                Write-Log '自检失败：明细条数与请求的 ID 数不一致（接口变更或 batchSize 超限？）' 'ERROR'
+                exit 1
+            }
+        }
+        Write-Log '自检模式：接口连通正常，目录与明细接口均可用。' 'OK'
         exit 0
     }
 
@@ -581,7 +600,7 @@ try {
         [void]$sb.AppendLine('')
     }
     [void]$sb.AppendLine('【第二组】其中，智慧沃家共享版用户可订购的方案')
-    [void]$sb.AppendLine('筛选模式：' + $wojiaMode + '（explicit=仅剔除文案中明确排除智慧沃家共享版的；strict=再剔除限定其他主套餐的）')
+    [void]$sb.AppendLine('筛选模式：' + $wojiaMode + '（explicit=剔除文案中明确排除智慧沃家共享版的方案，以及提到「智慧沃家」但排除/允许规则都没命中的 unclear；strict=再额外剔除适用范围限定其他主套餐的）')
     [void]$sb.AppendLine('共 ' + $groupB.Count + ' 个')
     [void]$sb.AppendLine('------------------------------------------------------------')
     [void]$sb.AppendLine((($groupB | ForEach-Object { $_.reportNo }) -join ', '))
