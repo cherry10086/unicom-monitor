@@ -34,18 +34,26 @@ $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
 # ---------------------------------------------------------------------------
+# TLS：接口只接受 TLS 1.2+（实测 TLS 1.0/1.1 会 "Could not create SSL/TLS secure
+# channel"），而 PowerShell 5.1 的默认协议取决于机器上的 .NET，旧机器会停在
+# TLS 1.0。这里显式固定；万一环境不支持也不致命，继续用系统默认值尝试。
+# ---------------------------------------------------------------------------
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+
+# ---------------------------------------------------------------------------
 # 基础路径
 # ---------------------------------------------------------------------------
 $Root = $PSScriptRoot
 if (-not $Root) { $Root = Split-Path -Parent $MyInvocation.MyCommand.Path }
 if (-not $ConfigPath) { $ConfigPath = Join-Path $Root 'config.json' }
+elseif (-not [System.IO.Path]::IsPathRooted($ConfigPath)) { $ConfigPath = Join-Path $Root $ConfigPath }
 
 $OutputRoot = Join-Path $Root 'output'
 $LatestDir  = Join-Path $OutputRoot 'latest'
 $HistoryDir = Join-Path $OutputRoot 'history'
 $LogDir     = Join-Path $OutputRoot 'logs'
 foreach ($d in @($OutputRoot, $LatestDir, $HistoryDir, $LogDir)) {
-    if (-not (Test-Path $d)) { [void](New-Item -ItemType Directory -Path $d -Force) }
+    if (-not (Test-Path -LiteralPath $d)) { [void](New-Item -ItemType Directory -Path $d -Force) }
 }
 
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -74,15 +82,60 @@ function Write-Log {
 }
 
 # ---------------------------------------------------------------------------
-# 配置
+# 配置：读取 + 体检
+#   注意 config.json 必须是 UTF-8。存成 ANSI/GBK 时中文会解成 U+FFFD，
+#   所有中文正则随之失效，而脚本会"正常"跑出「第一组 0 个」——必须拦下来。
 # ---------------------------------------------------------------------------
-if (-not (Test-Path $ConfigPath)) { throw ('配置文件不存在：' + $ConfigPath) }
-$cfg = (Read-Utf8File $ConfigPath) | ConvertFrom-Json
+if (-not (Test-Path -LiteralPath $ConfigPath)) { throw ('配置文件不存在：' + $ConfigPath) }
+$cfgText = Read-Utf8File $ConfigPath
+if ($cfgText -match "\uFFFD") {
+    throw 'config.json 不是有效的 UTF-8（很可能被保存成了 ANSI/GBK），请用记事本 / VS Code 另存为 UTF-8 后重试'
+}
+try { $cfg = $cfgText | ConvertFrom-Json }
+catch { throw ('config.json 不是合法 JSON：' + $_.Exception.Message) }
 
-$script:UA      = 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1'
-$script:Retry   = [int]$cfg.http.retry
-$script:Batch   = [int]$cfg.http.batchSize
-$script:DelayMs = [int]$cfg.http.delayMs
+# 空正则在 .NET 里会匹配任意字符串，缺键又会静默变成空串，这里逐项校验
+$patternKeys = [ordered]@{
+    'keywords.contentPattern'  = $cfg.keywords.contentPattern
+    'wojia.negativePattern'    = $cfg.wojia.negativePattern
+    'wojia.positivePattern'    = $cfg.wojia.positivePattern
+    'wojia.restrictionPattern' = $cfg.wojia.restrictionPattern
+}
+foreach ($k in $patternKeys.Keys) {
+    $v = [string]$patternKeys[$k]
+    if ([string]::IsNullOrWhiteSpace($v)) { throw ('config.json 缺少必要的正则：' + $k) }
+    try { [void](New-Object System.Text.RegularExpressions.Regex($v)) }
+    catch { throw ('config.json 的 ' + $k + ' 不是合法正则：' + $_.Exception.Message) }
+}
+if ([string]::IsNullOrWhiteSpace([string]$cfg.api.baseUrl)) { throw 'config.json 缺少 api.baseUrl' }
+if (-not $cfg.region.provinceId -or -not $cfg.region.cityId) { throw 'config.json 缺少 region.provinceId / region.cityId' }
+
+$firstNamesCfg  = @($cfg.scan.firstLevelNames)
+$secondNamesCfg = @($cfg.scan.secondLevelNames)
+if ($firstNamesCfg.Count -eq 0 -or $secondNamesCfg.Count -eq 0) { throw 'config.json 的 scan.firstLevelNames / scan.secondLevelNames 不能为空' }
+foreach ($ta in @($cfg.scan.tariffAttributes)) {
+    if (@(1, 2) -notcontains [int]$ta) { throw ('config.json 的 scan.tariffAttributes 只能是 1（全国资费）或 2（本省资费），收到：' + $ta) }
+}
+
+$wojiaModeCfg = [string]$cfg.wojia.mode
+if ([string]::IsNullOrWhiteSpace($wojiaModeCfg)) { $wojiaModeCfg = 'explicit' }
+if ($wojiaModeCfg -notin @('explicit', 'strict')) { throw ('config.json 的 wojia.mode 只能是 explicit 或 strict（当前：' + $wojiaModeCfg + '）') }
+
+$script:UA         = 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1'
+$script:BatchLimit = 100   # 接口硬上限：一次请求携带的 ID 数（实测 100 正常，101 返回 code=0001「查询超过数量限制」）
+$script:Retry      = [int]$cfg.http.retry
+$script:DelayMs    = [int]$cfg.http.delayMs
+$script:Batch      = [int]$cfg.http.batchSize
+
+if ($script:Retry -lt 1) { $script:Retry = 1 }
+if ($script:DelayMs -lt 0) { $script:DelayMs = 0 }
+if ($script:Batch -lt 1) {
+    throw ('config.json 的 http.batchSize 必须 >= 1（当前：' + $cfg.http.batchSize + '）；为 0 会让取明细的循环永远不前进')
+}
+if ($script:Batch -gt $script:BatchLimit) {
+    Write-Log ('http.batchSize=' + $script:Batch + ' 超过接口上限 ' + $script:BatchLimit + '，本次按 ' + $script:BatchLimit + ' 处理') 'WARN'
+    $script:Batch = $script:BatchLimit
+}
 
 # ---------------------------------------------------------------------------
 # HTTP：PowerShell 5.1 的 Invoke-RestMethod 会把无 charset 的响应按 Latin-1
@@ -170,8 +223,10 @@ function Get-PlanDetails {
     param([string[]]$Ids)
     $all = New-Object System.Collections.ArrayList
     $total = $Ids.Count
-    for ($i = 0; $i -lt $total; $i += $script:Batch) {
-        $end = [Math]::Min($i + $script:Batch - 1, $total - 1)
+    # 双保险：即使配置被改坏也不会死循环（step=0）或超过接口上限
+    $step = [Math]::Max(1, [Math]::Min($script:Batch, $script:BatchLimit))
+    for ($i = 0; $i -lt $total; $i += $step) {
+        $end = [Math]::Min($i + $step - 1, $total - 1)
         $chunk = $Ids[$i..$end]
         $path = '/queryTariffNew/operateData/' + ($chunk -join '_')
         $r = Invoke-Api $path @{ page = 1; size = 200 }
@@ -353,7 +408,7 @@ try {
 
     $prevFile = Join-Path $LatestDir 'groupA_all_matches.json'
     $prevNos = @()
-    if (Test-Path $prevFile) {
+    if (Test-Path -LiteralPath $prevFile) {
         try {
             $prev = (Read-Utf8File $prevFile) | ConvertFrom-Json
             $prevNos = @($prev | ForEach-Object { [string]$_.reportNo })
@@ -465,7 +520,7 @@ try {
         Write-Log '结果不完整，跳过历史归档' 'WARN'
     } elseif (-not $NoArchive) {
         $archiveDir = Join-Path $HistoryDir $stamp
-        if (-not (Test-Path $archiveDir)) { [void](New-Item -ItemType Directory -Path $archiveDir -Force) }
+        if (-not (Test-Path -LiteralPath $archiveDir)) { [void](New-Item -ItemType Directory -Path $archiveDir -Force) }
         Write-Utf8File (Join-Path $archiveDir 'groupA_all_matches.json') $groupAJson
         Write-Utf8File (Join-Path $archiveDir 'groupB_wojia_eligible.json') $groupBJson
         Write-Utf8File (Join-Path $archiveDir 'summary.txt') $summary
