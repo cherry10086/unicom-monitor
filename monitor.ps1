@@ -52,14 +52,33 @@ $OutputRoot = Join-Path $Root 'output'
 $LatestDir  = Join-Path $OutputRoot 'latest'
 $HistoryDir = Join-Path $OutputRoot 'history'
 $LogDir     = Join-Path $OutputRoot 'logs'
-foreach ($d in @($OutputRoot, $LatestDir, $HistoryDir, $LogDir)) {
+$dirsToCreate = @($OutputRoot, $LatestDir, $LogDir)
+if (-not $NoArchive) { $dirsToCreate += $HistoryDir }   # -NoArchive 时不再建空的 history 目录
+foreach ($d in $dirsToCreate) {
     if (-not (Test-Path -LiteralPath $d)) { [void](New-Item -ItemType Directory -Path $d -Force) }
 }
 
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 function Write-Utf8File([string]$Path, [string]$Text) {
-    [System.IO.File]::WriteAllText($Path, $Text, $script:Utf8NoBom)
+    # 临时文件 + 覆盖式改名 + 重试：避免"文件正被其它程序占用"时半途失败，
+    # 也避免别处读到写了一半的内容（summary.txt 被记事本/OneDrive/杀软占用很常见）。
+    # 注意：这里不能用 [IO.File]::Replace($tmp,$Path,$null) —— PowerShell 会把 $null
+    # 绑成空字符串，抛 "The path is not of a legal form"（实测），所以用 Move-Item -Force。
+    $tmp = $Path + '.tmp'
+    [System.IO.File]::WriteAllText($tmp, $Text, $script:Utf8NoBom)
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+            return
+        } catch {
+            if ($i -ge 5) {
+                try { [System.IO.File]::Delete($tmp) } catch { }
+                throw ('写入失败（已重试 5 次）：' + $Path + ' —— ' + $_.Exception.Message)
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    }
 }
 function Read-Utf8File([string]$Path) {
     return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
@@ -78,7 +97,35 @@ function Write-Log {
     if ($Level -eq 'ERROR') { $color = 'Red' }
     if ($Level -eq 'OK')    { $color = 'Green' }
     Write-Host $line -ForegroundColor $color
-    [System.IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine, $script:Utf8NoBom)
+    # 日志写不进去（例如另一个实例正占着）不应该杀掉整个监控，重试几次即可
+    for ($i = 1; $i -le 5; $i++) {
+        try { [System.IO.File]::AppendAllText($script:LogFile, $line + [Environment]::NewLine, $script:Utf8NoBom); return }
+        catch { Start-Sleep -Milliseconds 200 }
+    }
+    Write-Host ('（日志文件写入失败，已跳过：' + $script:LogFile + '）') -ForegroundColor DarkYellow
+}
+
+function Stop-WithLog {
+    # 启动阶段的致命错误：既写日志也退出（run-monitor.cmd 提示用户去看 output\logs，
+    # 所以配置类错误必须留下记录）
+    param([string]$Message)
+    Write-Log ('启动失败：' + $Message) 'ERROR'
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 互斥：计划任务与手动运行同时跑会互相覆盖 output\latest 与日志
+#（计划任务的 -MultipleInstances IgnoreNew 只防"任务 vs 任务"）
+# ---------------------------------------------------------------------------
+try { $script:RunMutex = New-Object System.Threading.Mutex($false, 'Global\UnicomPlanMonitor') }
+catch { $script:RunMutex = New-Object System.Threading.Mutex($false, 'Local\UnicomPlanMonitor') }
+$script:GotLock = $false
+try { $script:GotLock = $script:RunMutex.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $script:GotLock = $true }   # 上次被强杀，锁被放弃，本次视为拿到
+catch { $script:GotLock = $true }                                            # 锁本身出问题时不阻塞运行
+if (-not $script:GotLock) {
+    Write-Log '已有一次运行正在进行，本次跳过（互斥锁被占用）' 'WARN'
+    exit 3
 }
 
 # ---------------------------------------------------------------------------
@@ -86,6 +133,7 @@ function Write-Log {
 #   注意 config.json 必须是 UTF-8。存成 ANSI/GBK 时中文会解成 U+FFFD，
 #   所有中文正则随之失效，而脚本会"正常"跑出「第一组 0 个」——必须拦下来。
 # ---------------------------------------------------------------------------
+try {
 if (-not (Test-Path -LiteralPath $ConfigPath)) { throw ('配置文件不存在：' + $ConfigPath) }
 $cfgText = Read-Utf8File $ConfigPath
 if ($cfgText -match "\uFFFD") {
@@ -135,6 +183,11 @@ if ($script:Batch -lt 1) {
 if ($script:Batch -gt $script:BatchLimit) {
     Write-Log ('http.batchSize=' + $script:Batch + ' 超过接口上限 ' + $script:BatchLimit + '，本次按 ' + $script:BatchLimit + ' 处理') 'WARN'
     $script:Batch = $script:BatchLimit
+}
+} catch {
+    # 配置类错误也要落到日志里：run-monitor.cmd 提示用户「See output\logs for details」，
+    # 而配置错误原先发生在 try 之外，日志里一个字都没有。
+    Stop-WithLog $_.Exception.Message
 }
 
 # ---------------------------------------------------------------------------
@@ -336,6 +389,20 @@ try {
     if ($targets.Count -eq 0) { throw '未匹配到任何分类，请检查 config.json 的 scan.firstLevelNames / secondLevelNames' }
     Write-Log ('待扫描分类：' + (($targets | ForEach-Object { $_.FirstLevelName + '>' + $_.SecondLevelName }) -join '、'))
 
+    # 差集检查：config.json 里写了、但页面上已经找不到的分类名。
+    # 上游改名 / 配置打错字会让扫描范围静默缩水，而报告里的「扫描范围」还写着原名，
+    # 于是没扫到的那部分方案会被误报成「下线」——这里把这种运行判定为"结果不完整"。
+    $apiFirstAll  = @($index.data.levelList | ForEach-Object { [string]$_.firstLevelName } | Select-Object -Unique)
+    $apiSecondAll = @($index.data.levelList | Where-Object { $firstNames -contains [string]$_.firstLevelName } |
+                      ForEach-Object { $_.secondLevels } | ForEach-Object { [string]$_.secondLevelName } | Select-Object -Unique)
+    $missingFirst  = @($firstNames  | Where-Object { $apiFirstAll  -notcontains $_ })
+    $missingSecond = @($secondNames | Where-Object { $apiSecondAll -notcontains $_ })
+    $scopeChanged  = ($missingFirst.Count -gt 0 -or $missingSecond.Count -gt 0)
+    if ($scopeChanged) {
+        Write-Log ('配置里的分类在页面上不存在：一级=[' + ($missingFirst -join '、') + '] 二级=[' + ($missingSecond -join '、') +
+                   ']；页面现有二级分类=[' + ($apiSecondAll -join '、') + ']') 'WARN'
+    }
+
     if ($SelfTest) {
         Write-Log '自检模式：接口连通正常，目录读取成功。' 'OK'
         exit 0
@@ -356,7 +423,9 @@ try {
                 }
                 $ids = @($opts | ForEach-Object { [string]$_.id })
                 $details = Get-PlanDetails -Ids $ids
-                Write-Log ('  ' + $t.SecondLevelName + ' / ' + $scopeNm + '：选项 ' + $ids.Count + ' 个 → 方案 ' + $details.Count + ' 条')
+                # 注意：$details 只有一条时是单个对象，5.1 里标量 .Count 为空，会打出"方案  条"
+                $planCount = @($details).Count
+                Write-Log ('  ' + $t.SecondLevelName + ' / ' + $scopeNm + '：选项 ' + $ids.Count + ' 个 → 方案 ' + $planCount + ' 条')
                 foreach ($d in $details) {
                     [void]$rawRecords.Add((ConvertTo-PlanRecord -Item $d -CategoryName $t.SecondLevelName -ScopeName $scopeNm -TariffAttributes $taInt))
                 }
@@ -375,15 +444,25 @@ try {
     #   - 部分失败：结果写到 partial_*.json，跳过新增/下线对比，以退出码 2 结束
     # -----------------------------------------------------------------------
     $failedCount = $failedScans.Count
-    $isPartial   = ($failedCount -gt 0)
-    if ($isPartial) {
+    $isPartial   = ($failedCount -gt 0 -or $scopeChanged)
+    if ($failedCount -gt 0) {
         Write-Log ('本次有 ' + $failedCount + ' 个分类抓取失败：' + ($failedScans -join '、')) 'WARN'
         if ($rawRecords.Count -eq 0) {
             throw ('全部 ' + $failedCount + ' 个分类抓取失败，未抓到任何方案；保留上次结果，不覆盖 output\latest')
         }
     }
+    if ($scopeChanged) {
+        Write-Log '扫描范围与配置不一致（见上面的 WARN），本次按"结果不完整"处理' 'WARN'
+    }
 
-    $groupA = @($rawRecords | Where-Object { Test-ContentPattern $_.serviceContent } | Sort-Object reportNo, scope -Unique)
+    # 按方案编号去重：同一个方案号可能同时挂在本省资费与全国资费下，
+    # 用 (reportNo, scope) 做键会把它算成两条（计数翻倍、编号重复、重复报"新增"）。
+    $groupA = @($rawRecords | Where-Object { Test-ContentPattern $_.serviceContent } |
+        Group-Object reportNo | ForEach-Object {
+            $first = $_.Group[0]
+            $first.scope = (($_.Group | Select-Object -ExpandProperty scope -Unique) -join ',')
+            $first
+        } | Sort-Object reportNo)
 
     # 二次筛选：智慧沃家共享版
     #   explicit 模式（默认）：只剔除"适用范围里明确写了智慧沃家共享版不能订购"的方案
@@ -435,16 +514,14 @@ try {
     if ($groupB.Count -eq 1) { $groupBJson = '[' + ($groupB | ConvertTo-Json -Depth 6) + ']' }
     elseif ($groupB.Count -gt 1) { $groupBJson = ($groupB | ConvertTo-Json -Depth 6) }
 
-    # 抓取不完整时只写 partial_* 文件，绝不覆盖用作"上次结果基线"的正式文件
+    # 结果不完整 / 扫描范围与配置不一致时：本次结果只写 partial_* 文件，绝不碰
+    # 用作"上次结果基线"的正式文件。完整运行则等到 summary 与归档都写成功之后，
+    # 才在最后统一更新正式文件（基线最后写，避免"基线前进但报告没写完"）。
     $filePrefix = ''
-    if ($isPartial) { $filePrefix = 'partial_' }
-    Write-Utf8File (Join-Path $LatestDir ($filePrefix + 'groupA_all_matches.json')) $groupAJson
-    Write-Utf8File (Join-Path $LatestDir ($filePrefix + 'groupB_wojia_eligible.json')) $groupBJson
-    if (-not $isPartial) {
-        $newJson = '[]'
-        if ($newOnes.Count -eq 1) { $newJson = '[' + ($newOnes | ConvertTo-Json) + ']' }
-        elseif ($newOnes.Count -gt 1) { $newJson = ($newOnes | ConvertTo-Json) }
-        Write-Utf8File (Join-Path $LatestDir 'new_since_last_run.json') $newJson
+    if ($isPartial) {
+        $filePrefix = 'partial_'
+        Write-Utf8File (Join-Path $LatestDir ($filePrefix + 'groupA_all_matches.json')) $groupAJson
+        Write-Utf8File (Join-Path $LatestDir ($filePrefix + 'groupB_wojia_eligible.json')) $groupBJson
     }
 
     $sb = New-Object System.Text.StringBuilder
@@ -453,10 +530,17 @@ try {
     [void]$sb.AppendLine('生成时间：' + $startTime.ToString('yyyy-MM-dd HH:mm:ss'))
     if ($isPartial) {
         [void]$sb.AppendLine('')
-        [void]$sb.AppendLine('！！本次运行结果不完整！！')
-        [void]$sb.AppendLine('有 ' + $failedCount + ' 个分类抓取失败，以下内容只反映抓到的部分：')
-        foreach ($f in $failedScans) { [void]$sb.AppendLine('  - ' + $f) }
-        [void]$sb.AppendLine('正式结果文件（groupA_all_matches.json / groupB_wojia_eligible.json / new_since_last_run.json / summary.txt）未被更新，本次结果见 partial_*.json 与 partial_summary.txt。')
+        [void]$sb.AppendLine('！！本次运行结果不完整，未更新正式结果文件！！')
+        if ($failedCount -gt 0) {
+            [void]$sb.AppendLine('有 ' + $failedCount + ' 个分类抓取失败：')
+            foreach ($f in $failedScans) { [void]$sb.AppendLine('  - ' + $f) }
+        }
+        if ($scopeChanged) {
+            [void]$sb.AppendLine('配置里的分类在页面上不存在（可能被上游改名）：')
+            if ($missingFirst.Count)  { [void]$sb.AppendLine('  - 一级分类：' + ($missingFirst -join '、')) }
+            if ($missingSecond.Count) { [void]$sb.AppendLine('  - 二级分类：' + ($missingSecond -join '、')) }
+        }
+        [void]$sb.AppendLine('以下内容只反映本次实际抓到的部分，见 partial_*.json 与 partial_summary.txt。')
     }
     [void]$sb.AppendLine('地区：' + $cfg.region.provinceName + '-' + $cfg.region.cityName)
     [void]$sb.AppendLine('扫描范围：' + (($targets | ForEach-Object { $_.FirstLevelName + '>' + $_.SecondLevelName }) -join '、'))
@@ -529,14 +613,28 @@ try {
         Write-Log ('历史归档：' + $archiveDir)
     }
 
+    # 最后才更新「上次结果基线」：summary 与归档都写成功之后，才让基线前进。
+    # 否则一旦中途失败，基线已经变了而报告还是旧的，本次的"新增"事件会永久丢失。
+    if (-not $isPartial) {
+        $newJson = '[]'
+        if ($newOnes.Count -eq 1) { $newJson = '[' + ($newOnes | ConvertTo-Json) + ']' }
+        elseif ($newOnes.Count -gt 1) { $newJson = ($newOnes | ConvertTo-Json) }
+        Write-Utf8File (Join-Path $LatestDir 'new_since_last_run.json') $newJson
+        Write-Utf8File (Join-Path $LatestDir 'groupB_wojia_eligible.json') $groupBJson
+        Write-Utf8File (Join-Path $LatestDir 'groupA_all_matches.json') $groupAJson
+    }
+
     Write-Log '----------- 汇总 -----------'
     $aNos = '无'; if ($groupA.Count) { $aNos = ($groupA | ForEach-Object { $_.reportNo }) -join ', ' }
     $bNos = '无'; if ($groupB.Count) { $bNos = ($groupB | ForEach-Object { $_.reportNo }) -join ', ' }
     Write-Log ('第一组方案编号：' + $aNos)
     Write-Log ('第二组方案编号：' + $bNos)
     if ($isPartial) {
-        Write-Log ('新增：未对比（本次抓取不完整，' + $failedCount + ' 个分类失败）') 'WARN'
-        Write-Log '下线：未对比（本次抓取不完整）' 'WARN'
+        $why = @()
+        if ($failedCount -gt 0) { $why += ($failedCount.ToString() + ' 个分类抓取失败') }
+        if ($scopeChanged)      { $why += '扫描范围与配置不一致' }
+        Write-Log ('新增：未对比（结果不完整：' + ($why -join '；') + '）') 'WARN'
+        Write-Log '下线：未对比（结果不完整）' 'WARN'
     } else {
         if ($newOnes.Count) { Write-Log ('新增：' + ($newOnes -join ', ')) } else { Write-Log '新增：无' }
         if ($goneOnes.Count) { Write-Log ('下线：' + ($goneOnes -join ', ')) } else { Write-Log '下线：无' }
@@ -544,7 +642,7 @@ try {
     Write-Log ('结果目录：' + $LatestDir)
     Write-Log ('耗时 ' + [int]((Get-Date) - $startTime).TotalSeconds + ' 秒') 'OK'
     if ($isPartial) {
-        Write-Log ('结果不完整（' + $failedCount + ' 个分类抓取失败），以退出码 2 结束') 'WARN'
+        Write-Log '结果不完整，以退出码 2 结束' 'WARN'
         exit 2
     }
     exit 0
