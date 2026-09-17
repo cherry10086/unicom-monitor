@@ -285,6 +285,7 @@ try {
     }
 
     $rawRecords = New-Object System.Collections.ArrayList
+    $failedScans = New-Object System.Collections.ArrayList
     foreach ($t in $targets) {
         foreach ($ta in @($cfg.scan.tariffAttributes)) {
             $taInt   = [int]$ta
@@ -304,11 +305,26 @@ try {
                 }
             }
             catch {
+                [void]$failedScans.Add($t.SecondLevelName + ' / ' + $scopeNm)
                 Write-Log ('  ' + $t.SecondLevelName + ' / ' + $scopeNm + ' 抓取失败：' + $_.Exception.Message) 'ERROR'
             }
         }
     }
     Write-Log ('共抓取方案 ' + $rawRecords.Count + ' 条') 'OK'
+
+    # -----------------------------------------------------------------------
+    # 抓取失败处理：绝不能把"没抓到"当成"没有了"
+    #   - 全部失败：抛错退出，保留上次结果，不覆盖 output\latest
+    #   - 部分失败：结果写到 partial_*.json，跳过新增/下线对比，以退出码 2 结束
+    # -----------------------------------------------------------------------
+    $failedCount = $failedScans.Count
+    $isPartial   = ($failedCount -gt 0)
+    if ($isPartial) {
+        Write-Log ('本次有 ' + $failedCount + ' 个分类抓取失败：' + ($failedScans -join '、')) 'WARN'
+        if ($rawRecords.Count -eq 0) {
+            throw ('全部 ' + $failedCount + ' 个分类抓取失败，未抓到任何方案；保留上次结果，不覆盖 output\latest')
+        }
+    }
 
     $groupA = @($rawRecords | Where-Object { Test-ContentPattern $_.serviceContent } | Sort-Object reportNo, scope -Unique)
 
@@ -344,8 +360,15 @@ try {
         } catch { Write-Log '上次结果读取失败，跳过对比' 'WARN' }
     }
     $nowNos   = @($groupA | ForEach-Object { [string]$_.reportNo })
-    $newOnes  = @($nowNos | Where-Object { $prevNos -notcontains $_ })
-    $goneOnes = @($prevNos | Where-Object { $nowNos -notcontains $_ })
+    if ($isPartial) {
+        # 结果不完整，本次不做对比：否则会把没抓到的方案误报成"下线"
+        $newOnes  = @()
+        $goneOnes = @()
+        Write-Log '结果不完整，本次跳过「新增/下线」对比' 'WARN'
+    } else {
+        $newOnes  = @($nowNos | Where-Object { $prevNos -notcontains $_ })
+        $goneOnes = @($prevNos | Where-Object { $nowNos -notcontains $_ })
+    }
 
     $stamp = $startTime.ToString('yyyy-MM-dd_HHmmss')
     $groupAJson = '[]'
@@ -355,17 +378,29 @@ try {
     if ($groupB.Count -eq 1) { $groupBJson = '[' + ($groupB | ConvertTo-Json -Depth 6) + ']' }
     elseif ($groupB.Count -gt 1) { $groupBJson = ($groupB | ConvertTo-Json -Depth 6) }
 
-    Write-Utf8File (Join-Path $LatestDir 'groupA_all_matches.json') $groupAJson
-    Write-Utf8File (Join-Path $LatestDir 'groupB_wojia_eligible.json') $groupBJson
-    $newJson = '[]'
-    if ($newOnes.Count -eq 1) { $newJson = '[' + ($newOnes | ConvertTo-Json) + ']' }
-    elseif ($newOnes.Count -gt 1) { $newJson = ($newOnes | ConvertTo-Json) }
-    Write-Utf8File (Join-Path $LatestDir 'new_since_last_run.json') $newJson
+    # 抓取不完整时只写 partial_* 文件，绝不覆盖用作"上次结果基线"的正式文件
+    $filePrefix = ''
+    if ($isPartial) { $filePrefix = 'partial_' }
+    Write-Utf8File (Join-Path $LatestDir ($filePrefix + 'groupA_all_matches.json')) $groupAJson
+    Write-Utf8File (Join-Path $LatestDir ($filePrefix + 'groupB_wojia_eligible.json')) $groupBJson
+    if (-not $isPartial) {
+        $newJson = '[]'
+        if ($newOnes.Count -eq 1) { $newJson = '[' + ($newOnes | ConvertTo-Json) + ']' }
+        elseif ($newOnes.Count -gt 1) { $newJson = ($newOnes | ConvertTo-Json) }
+        Write-Utf8File (Join-Path $LatestDir 'new_since_last_run.json') $newJson
+    }
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('============================================================')
     [void]$sb.AppendLine('联通加装包 5G 上网服务方案监控报告')
     [void]$sb.AppendLine('生成时间：' + $startTime.ToString('yyyy-MM-dd HH:mm:ss'))
+    if ($isPartial) {
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('！！本次运行结果不完整！！')
+        [void]$sb.AppendLine('有 ' + $failedCount + ' 个分类抓取失败，以下内容只反映抓到的部分：')
+        foreach ($f in $failedScans) { [void]$sb.AppendLine('  - ' + $f) }
+        [void]$sb.AppendLine('正式结果文件（groupA_all_matches.json / groupB_wojia_eligible.json / new_since_last_run.json / summary.txt）未被更新，本次结果见 partial_*.json 与 partial_summary.txt。')
+    }
     [void]$sb.AppendLine('地区：' + $cfg.region.provinceName + '-' + $cfg.region.cityName)
     [void]$sb.AppendLine('扫描范围：' + (($targets | ForEach-Object { $_.FirstLevelName + '>' + $_.SecondLevelName }) -join '、'))
     $scopeNames = @($cfg.scan.tariffAttributes | ForEach-Object { if ([int]$_ -eq 2) { '本省资费' } else { '全国资费' } })
@@ -416,13 +451,19 @@ try {
         [void]$sb.AppendLine('')
     }
     [void]$sb.AppendLine('【与上次运行对比】')
-    if ($newOnes.Count) { [void]$sb.AppendLine('新增方案：' + ($newOnes -join ', ')) } else { [void]$sb.AppendLine('新增方案：无') }
-    if ($goneOnes.Count) { [void]$sb.AppendLine('下线方案：' + ($goneOnes -join ', ')) } else { [void]$sb.AppendLine('下线方案：无') }
+    if ($isPartial) {
+        [void]$sb.AppendLine('本次抓取不完整，未做对比（避免把没抓到的方案误报成“下线”）。')
+    } else {
+        if ($newOnes.Count) { [void]$sb.AppendLine('新增方案：' + ($newOnes -join ', ')) } else { [void]$sb.AppendLine('新增方案：无') }
+        if ($goneOnes.Count) { [void]$sb.AppendLine('下线方案：' + ($goneOnes -join ', ')) } else { [void]$sb.AppendLine('下线方案：无') }
+    }
     $summary = $sb.ToString()
 
-    Write-Utf8File (Join-Path $LatestDir 'summary.txt') $summary
+    Write-Utf8File (Join-Path $LatestDir ($filePrefix + 'summary.txt')) $summary
 
-    if (-not $NoArchive) {
+    if ($isPartial) {
+        Write-Log '结果不完整，跳过历史归档' 'WARN'
+    } elseif (-not $NoArchive) {
         $archiveDir = Join-Path $HistoryDir $stamp
         if (-not (Test-Path $archiveDir)) { [void](New-Item -ItemType Directory -Path $archiveDir -Force) }
         Write-Utf8File (Join-Path $archiveDir 'groupA_all_matches.json') $groupAJson
@@ -436,10 +477,19 @@ try {
     $bNos = '无'; if ($groupB.Count) { $bNos = ($groupB | ForEach-Object { $_.reportNo }) -join ', ' }
     Write-Log ('第一组方案编号：' + $aNos)
     Write-Log ('第二组方案编号：' + $bNos)
-    if ($newOnes.Count) { Write-Log ('新增：' + ($newOnes -join ', ')) } else { Write-Log '新增：无' }
-    if ($goneOnes.Count) { Write-Log ('下线：' + ($goneOnes -join ', ')) } else { Write-Log '下线：无' }
+    if ($isPartial) {
+        Write-Log ('新增：未对比（本次抓取不完整，' + $failedCount + ' 个分类失败）') 'WARN'
+        Write-Log '下线：未对比（本次抓取不完整）' 'WARN'
+    } else {
+        if ($newOnes.Count) { Write-Log ('新增：' + ($newOnes -join ', ')) } else { Write-Log '新增：无' }
+        if ($goneOnes.Count) { Write-Log ('下线：' + ($goneOnes -join ', ')) } else { Write-Log '下线：无' }
+    }
     Write-Log ('结果目录：' + $LatestDir)
     Write-Log ('耗时 ' + [int]((Get-Date) - $startTime).TotalSeconds + ' 秒') 'OK'
+    if ($isPartial) {
+        Write-Log ('结果不完整（' + $failedCount + ' 个分类抓取失败），以退出码 2 结束') 'WARN'
+        exit 2
+    }
     exit 0
 }
 catch {
