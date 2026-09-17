@@ -244,13 +244,25 @@ function New-CommonForm {
 
 function Invoke-Api {
     param([string]$Path, [hashtable]$Extra)
-    $url = ([string]$cfg.api.baseUrl).TrimEnd('/') + $Path
-    $txt = Invoke-UnicomPost -Url $url -Form (New-CommonForm $Extra)
-    $obj = $txt | ConvertFrom-Json
-    if ($obj.code -ne '0000') {
-        throw ('接口返回异常：Path=' + $Path + ' code=' + $obj.code + ' msg=' + $obj.msg)
+    $url  = ([string]$cfg.api.baseUrl).TrimEnd('/') + $Path
+    $form = New-CommonForm $Extra
+    # 传输层异常（连接被断等）由 Invoke-UnicomPost 重试；这里覆盖另外两种情况：
+    # HTTP 200 但返回的不是 JSON（被代理/网关拦截），以及 code != '0000'。
+    # 线上实测出现过「中间设备返回非 JSON 内容，导致一个分类整类丢失」，重试一次即可。
+    for ($attempt = 1; $attempt -le $script:Retry; $attempt++) {
+        $txt = Invoke-UnicomPost -Url $url -Form $form
+        $obj = $null
+        $why = ''
+        try { $obj = $txt | ConvertFrom-Json }
+        catch { $why = '返回内容不是 JSON：' + $_.Exception.Message }
+        if ($null -ne $obj) {
+            if ([string]$obj.code -eq '0000') { return $obj }
+            $why = 'code=' + $obj.code + ' msg=' + $obj.msg
+        }
+        if ($attempt -ge $script:Retry) { throw ('接口返回异常：Path=' + $Path + ' ' + $why) }
+        Write-Log ('接口返回异常（第 ' + $attempt + ' 次），2 秒后重试：' + $why) 'WARN'
+        Start-Sleep -Seconds 2
     }
-    return $obj
 }
 
 # ---------------------------------------------------------------------------
