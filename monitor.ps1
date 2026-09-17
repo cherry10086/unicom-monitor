@@ -277,10 +277,12 @@ function Get-RestrictionInfo {
 
 function ConvertTo-PlanRecord {
     param($Item, [string]$CategoryName, [string]$ScopeName, [string]$TariffAttributes)
+    # 判定文本只用「适用范围 + 其他事项」。
+    # 方案名称不参与判定：名字里带「（智慧沃家共享版）」是产品归属标记，不是订购限制，
+    # 把它算进来会把专门面向智慧沃家共享版用户的产品判成"不能订购"。
     $verdictText = @(
         [string]$Item.useScope,
-        [string]$Item.otherDesc,
-        [string]$Item.name
+        [string]$Item.otherDesc
     ) -join '。'
 
     $ri = Get-RestrictionInfo ([string]$Item.useScope)
