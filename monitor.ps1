@@ -133,6 +133,16 @@ if (-not $script:GotLock) {
 #   注意 config.json 必须是 UTF-8。存成 ANSI/GBK 时中文会解成 U+FFFD，
 #   所有中文正则随之失效，而脚本会"正常"跑出「第一组 0 个」——必须拦下来。
 # ---------------------------------------------------------------------------
+function Get-ScanTariffAttributes {
+    param($Values)
+    $attributes = @($Values)
+    if ($attributes.Count -eq 0 -or $null -eq $Values) { throw 'config.json 的 scan.tariffAttributes 不能为空' }
+    foreach ($value in $attributes) {
+        if (@('1', '2') -notcontains [string]$value) { throw ('scan.tariffAttributes 只能是 1 或 2，收到：' + $value) }
+    }
+    return $attributes
+}
+
 try {
 if (-not (Test-Path -LiteralPath $ConfigPath)) { throw ('配置文件不存在：' + $ConfigPath) }
 $cfgText = Read-Utf8File $ConfigPath
@@ -161,9 +171,7 @@ if (-not $cfg.region.provinceId -or -not $cfg.region.cityId) { throw 'config.jso
 $firstNamesCfg  = @($cfg.scan.firstLevelNames)
 $secondNamesCfg = @($cfg.scan.secondLevelNames)
 if ($firstNamesCfg.Count -eq 0 -or $secondNamesCfg.Count -eq 0) { throw 'config.json 的 scan.firstLevelNames / scan.secondLevelNames 不能为空' }
-foreach ($ta in @($cfg.scan.tariffAttributes)) {
-    if (@(1, 2) -notcontains [int]$ta) { throw ('config.json 的 scan.tariffAttributes 只能是 1（全国资费）或 2（本省资费），收到：' + $ta) }
-}
+$tariffAttributesCfg = @(Get-ScanTariffAttributes $cfg.scan.tariffAttributes)
 
 $wojiaModeCfg = [string]$cfg.wojia.mode
 if ([string]::IsNullOrWhiteSpace($wojiaModeCfg)) { $wojiaModeCfg = 'explicit' }
@@ -280,7 +288,7 @@ function Get-ThirdLevelOptions {
         firstLevel       = $FirstLevel
         secondLevel      = $SecondLevel
     }
-    if ($null -eq $r.data -or $null -eq $r.data.dataList) { return @() }
+    if ($null -eq $r.data -or $null -eq $r.data.dataList) { throw '分类接口缺少 data.dataList，无法确认扫描完整' }
     return @($r.data.dataList)
 }
 
@@ -295,9 +303,12 @@ function Get-PlanDetails {
         $chunk = $Ids[$i..$end]
         $path = '/queryTariffNew/operateData/' + ($chunk -join '_')
         $r = Invoke-Api $path @{ page = 1; size = 200 }
-        if ($null -ne $r.data -and $null -ne $r.data.detailList) {
-            foreach ($it in $r.data.detailList) { [void]$all.Add($it) }
+        if ($null -eq $r.data -or $null -eq $r.data.detailList) { throw '明细接口缺少 data.detailList' }
+        $batchDetails = @($r.data.detailList)
+        if ($batchDetails.Count -ne $chunk.Count -or @($batchDetails | Where-Object { $null -eq $_ }).Count -gt 0) {
+            throw ('明细返回不完整：请求 ' + $chunk.Count + ' 个 ID，返回 ' + $batchDetails.Count + ' 条；保留上次基线')
         }
+        foreach ($it in $batchDetails) { [void]$all.Add($it) }
         if ($script:DelayMs -gt 0) { Start-Sleep -Milliseconds $script:DelayMs }
     }
     return $all
@@ -419,13 +430,13 @@ try {
         # 自检不能只看目录：真的走一遍 threeLevelName + operateData，确认数据链路可用。
         # （batchSize 配错、接口路径变更、被网关拦成非 JSON 这类问题，原来在自检里看不出来。）
         $probe = $targets[0]
-        $probeTa = [int](@($cfg.scan.tariffAttributes)[0])
+        $probeTa = [int]($tariffAttributesCfg[0])
         $probeScope = '全国资费'
         if ($probeTa -eq 2) { $probeScope = '本省资费' }
         $opts = @(Get-ThirdLevelOptions -TariffAttributes $probeTa -FirstLevel $probe.FirstLevel -SecondLevel $probe.SecondLevel)
         Write-Log ('自检：目录读取成功；抽查 ' + $probe.FirstLevelName + '>' + $probe.SecondLevelName + '（' + $probeScope + '）选项 ' + $opts.Count + ' 个') 'OK'
         if ($opts.Count -eq 0) {
-            Write-Log '自检：抽查分类没有可选项，无法验证明细接口（可能是该分类暂时为空）' 'WARN'
+            throw '自检未完成：抽查分类没有可选项，无法验证明细接口；请使用有可选项的分类重试'
         } else {
             $probeIds = @($opts | Select-Object -First ([Math]::Min(3, $opts.Count)) | ForEach-Object { [string]$_.id })
             $probePlans = @(Get-PlanDetails -Ids $probeIds)
@@ -442,7 +453,7 @@ try {
     $rawRecords = New-Object System.Collections.ArrayList
     $failedScans = New-Object System.Collections.ArrayList
     foreach ($t in $targets) {
-        foreach ($ta in @($cfg.scan.tariffAttributes)) {
+        foreach ($ta in $tariffAttributesCfg) {
             $taInt   = [int]$ta
             $scopeNm = '全国资费'
             if ($taInt -eq 2) { $scopeNm = '本省资费' }
